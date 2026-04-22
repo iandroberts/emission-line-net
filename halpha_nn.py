@@ -242,13 +242,16 @@ def generate_dataset(n_spectra, lam, alpha=0.0,
 
     Returns
     -------
-    spectra : ndarray, shape (n_spectra, n_pixels)
-    labels  : ndarray, shape (n_spectra,) -- 1 if lines present, 0 otherwise
-    params  : list of tuple or None -- eline_params per spectrum
-    lam     : ndarray, shape (n_pixels,) -- wavelength array [Angstroms]
+    spectra     : ndarray, shape (n_spectra, n_pixels)
+    labels      : ndarray, shape (n_spectra,) -- 1 if lines present, 0 otherwise
+    reg_targets : ndarray, shape (n_spectra, 4) -- regression targets
+                  [log10(amp_HA), log10(ha_nii_ratio), vel, log10(vdisp_true)]
+                  NaN for no-line spectra.
+    params      : list of tuple or None -- eline_params per spectrum
+    lam         : ndarray, shape (n_pixels,) -- wavelength array [Angstroms]
     """
     rng = np.random.default_rng(seed)
-    spectra, labels, params = [], [], []
+    spectra, labels, reg_targets, params = [], [], [], []
 
     regimes = ["background", "tail", "disk_no_line", "disk_line"]
 
@@ -292,38 +295,65 @@ def generate_dataset(n_spectra, lam, alpha=0.0,
         labels.append(int(eline_params is not None))
         params.append(eline_params)       # None for no-line spectra
 
-    return np.array(spectra), np.array(labels), params, lam
+        # regression targets: log10(amp_HA), log10(ha_nii_ratio),
+        #                     vel [km/s],    log10(vdisp_true)
+        # NaN-filled for no-line spectra; masked in loss computation
+        if eline_params is not None:
+            amp_HA, ha_nii_ratio, vel, vdisp_true = eline_params
+            reg_target = np.array([
+                np.log10(amp_HA),
+                np.log10(ha_nii_ratio),
+                vel,
+                np.log10(vdisp_true),
+            ], dtype=np.float32)
+        else:
+            reg_target = np.full(4, np.nan, dtype=np.float32)
+        reg_targets.append(reg_target)
+
+    return np.array(spectra), np.array(labels), np.array(reg_targets), params, lam
 
 class SpectraDataset(Dataset):
-    def __init__(self, spectra, labels):
-        self.X = torch.tensor(spectra, dtype=torch.float32).unsqueeze(1)
-        self.y = torch.tensor(labels, dtype=torch.float32)
+    def __init__(self, spectra, labels, reg_targets):
+        self.X   = torch.tensor(spectra,     dtype=torch.float32).unsqueeze(1)
+        self.y   = torch.tensor(labels,      dtype=torch.float32)
+        self.reg = torch.tensor(reg_targets, dtype=torch.float32)
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.X[idx], self.y[idx], self.reg[idx]
 
 class LineDetector(nn.Module):
     def __init__(self, n_pixels, n_filters=32, kernel_size=7):
         super().__init__()
-        self.conv = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Conv1d(1, n_filters, kernel_size, padding="same"),
             nn.ReLU(),
             nn.Conv1d(n_filters, n_filters*2, kernel_size, padding="same"),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
-        )
-        self.head = nn.Sequential(
             nn.Flatten(),
+        )
+        # classification head: outputs single logit
+        self.clf_head = nn.Sequential(
             nn.Linear(n_filters*2, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )
+        # regression head: outputs 4 values
+        #   [log10(amp_HA), log10(ha_nii_ratio), vel, log10(vdisp_true)]
+        self.reg_head = nn.Sequential(
+            nn.Linear(n_filters*2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4),
+        )
 
     def forward(self, x):
-        return self.head(self.conv(x)).squeeze(1)
+        features = self.encoder(x)
+        logit    = self.clf_head(features).squeeze(1)
+        reg      = self.reg_head(features)
+        return logit, reg
 
 class LineDetectorMLP(nn.Module):
     def __init__(self, n_pixels, hidden_size=256):
@@ -341,25 +371,63 @@ class LineDetectorMLP(nn.Module):
         return self.net(x).squeeze(1)
 
 def train_model(train_dataset, val_dataset, model, epochs=20,
+        lambda_reg=1.0, batch_size=256, lr=1e-3, device="cpu"):
+    """
+    Train the LineDetector jointly on classification and regression tasks.
 
-        batch_size=256, lr=1e-3, device="cpu"):
+    Parameters
+    ----------
+    train_dataset, val_dataset : SpectraDataset
+    model : LineDetector
+    epochs : int
+    lambda_reg : float
+        Weight of the regression loss relative to classification loss.
+        Default 1.0.
+    batch_size : int
+    lr : float
+    device : str
 
+    Returns
+    -------
+    model : trained LineDetector
+    best_auc : float
+    """
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
         shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    model = model.to(device)
-    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
+    model       = model.to(device)
+    optimiser   = torch.optim.Adam(model.parameters(), lr=lr)
+    clf_loss_fn = nn.BCEWithLogitsLoss()
+    reg_loss_fn = nn.HuberLoss(reduction="none")
 
     best_auc = 0.0
     for epoch in range(epochs):
         # --- train ---
         model.train()
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        for X_batch, y_batch, reg_batch in train_loader:
+            X_batch   = X_batch.to(device)
+            y_batch   = y_batch.to(device)
+            reg_batch = reg_batch.to(device)
+
             optimiser.zero_grad()
-            loss = criterion(model(X_batch), y_batch)
+            logits, reg_pred = model(X_batch)
+
+            # classification loss over all examples
+            clf_loss = clf_loss_fn(logits, y_batch)
+
+            # regression loss only on positive examples (lines present)
+            # NaN targets for no-line spectra are masked out
+            pos_mask = y_batch.bool()
+            if pos_mask.any():
+                reg_loss = reg_loss_fn(
+                    reg_pred[pos_mask],
+                    reg_batch[pos_mask]
+                ).mean()
+            else:
+                reg_loss = torch.tensor(0.0, device=device)
+
+            loss = clf_loss + lambda_reg * reg_loss
             loss.backward()
             optimiser.step()
 
@@ -367,14 +435,14 @@ def train_model(train_dataset, val_dataset, model, epochs=20,
         model.eval()
         all_logits, all_labels = [], []
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                logits = model(X_batch.to(device)).cpu()
-                all_logits.append(logits)
+            for X_batch, y_batch, _ in val_loader:
+                logits, _ = model(X_batch.to(device))
+                all_logits.append(logits.cpu())
                 all_labels.append(y_batch)
 
         logits = torch.cat(all_logits).numpy()
         labels = torch.cat(all_labels).numpy()
-        auc = roc_auc_score(labels, logits)
+        auc    = roc_auc_score(labels, logits)
         best_auc = max(best_auc, auc)
         print(f"  epoch {epoch+1:2d}/{epochs}  AUC={auc:.4f}")
 
@@ -391,18 +459,18 @@ def learning_curve_experiment(alpha, wave, val_size=50_000, train_sizes=None,
 
     # fixed validation set - generated once, never changes
     print(f"Generating validation set ({val_size:,} spectra)...")
-    val_spectra, val_labels, _, lam = generate_dataset(
+    val_spectra, val_labels, val_reg, _, lam = generate_dataset(
             val_size, wave,
             alpha=alpha, seed=seed,
     )
-    val_dataset = SpectraDataset(val_spectra, val_labels)
+    val_dataset = SpectraDataset(val_spectra, val_labels, val_reg)
     n_pixels = val_spectra.shape[1]
 
     # generate largest training set once, then slice it
     # ensures smaller sets are strict subsets
     max_n = max(train_sizes)
     print(f"Generating full training pool ({max_n:,} spectra)...")
-    all_spectra, all_labels, _, _ = generate_dataset(
+    all_spectra, all_labels, all_reg, _, _ = generate_dataset(
             max_n, wave,
             alpha=alpha, seed=seed+1,
     )
@@ -410,7 +478,7 @@ def learning_curve_experiment(alpha, wave, val_size=50_000, train_sizes=None,
     aucs = []
     for n in train_sizes:
         print(f"\n--- Training on {n:,} spectra ---")
-        train_dataset = SpectraDataset(all_spectra[:n], all_labels[:n])
+        train_dataset = SpectraDataset(all_spectra[:n], all_labels[:n], all_reg[:n])
         _, auc = train_model(
             train_dataset,
             val_dataset,
@@ -459,23 +527,26 @@ def run_inference(model, obs, device="cpu", batch_size=1024):
 
     Parameters
     ----------
-    model : nn.Module
-        Trained PyTorch model. Must be in eval mode or will be set to eval.
+    model : LineDetector
+        Trained model.
     obs : ObservedData
-        Observed data object containing flux cube and spatial coordinates.
+        Observed data object.
     device : str, optional
-        Torch device string. Default "cpu".
+        Default "cpu".
     batch_size : int, optional
-        Number of spaxels per inference batch. Default 1024.
+        Default 1024.
 
     Returns
     -------
     prob_map : ndarray, shape (ny, nx)
         Per-spaxel detection probability in [0, 1].
+    reg_maps : dict of ndarray, shape (ny, nx)
+        Per-spaxel regression outputs, keyed by parameter name.
+        Values are in physical units (amp_HA in flux units, vel in km/s,
+        vdisp in km/s). Only meaningful where prob_map is high.
     """
     ny, nx = obs.flux.shape[1], obs.flux.shape[2]
 
-    # reshape (n_wav, ny, nx) -> (ny*nx, 1, n_wav) for Conv1d
     spectra = obs.flux.transpose(1, 2, 0).reshape(-1, obs.flux.shape[0])
     spectra = spectra.astype(np.float32)
     spectra = torch.tensor(spectra, dtype=torch.float32).unsqueeze(1)
@@ -483,16 +554,25 @@ def run_inference(model, obs, device="cpu", batch_size=1024):
     model = model.to(device)
     model.eval()
 
-    all_probs = []
+    all_probs, all_reg = [], []
     with torch.no_grad():
         for i in range(0, len(spectra), batch_size):
-            batch  = spectra[i:i+batch_size].to(device)
-            logits = model(batch).cpu()
-            probs  = torch.sigmoid(logits)
-            all_probs.append(probs)
+            batch        = spectra[i:i+batch_size].to(device)
+            logits, reg  = model(batch)
+            all_probs.append(torch.sigmoid(logits).cpu())
+            all_reg.append(reg.cpu())
 
     prob_map = torch.cat(all_probs).numpy().reshape(ny, nx)
-    return prob_map
+    reg_out  = torch.cat(all_reg).numpy()   # shape (ny*nx, 4)
+
+    # convert from log/linear predicted space back to physical units
+    reg_maps = {
+        "amp_HA"  : (10 ** reg_out[:, 0]).reshape(ny, nx),
+        "nii_ha"  : (10 ** reg_out[:, 1]).reshape(ny, nx),
+        "vel"     :        reg_out[:, 2].reshape(ny, nx),
+        "vdisp"   : (10 ** reg_out[:, 3]).reshape(ny, nx),
+    }
+    return prob_map, reg_maps
 
 def plot_detection_map(prob_map, threshold=0.5):
     """
@@ -552,18 +632,18 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(model_path, map_location=device))
     else:
         print(f"Generating validation set ({val_size:,} spectra)...")
-        val_spectra, val_labels, _, lam = generate_dataset(
+        val_spectra, val_labels, val_reg, _, lam = generate_dataset(
             val_size, obs.wave,
             alpha=alpha, seed=seed
         )
-        val_dataset = SpectraDataset(val_spectra, val_labels)
+        val_dataset = SpectraDataset(val_spectra, val_labels, val_reg)
 
         print(f"Generating training set ({train_size:,} spectra)...")
-        train_spectra, train_labels, _, _ = generate_dataset(
+        train_spectra, train_labels, train_reg, _, _ = generate_dataset(
             train_size, obs.wave,
             alpha=alpha, seed=seed+1
         )
-        train_dataset = SpectraDataset(train_spectra, train_labels)
+        train_dataset = SpectraDataset(train_spectra, train_labels, train_reg)
 
         model, auc = train_model(train_dataset, val_dataset, model,
             device=device)
@@ -572,5 +652,26 @@ if __name__ == "__main__":
         print(f"Model saved to {model_path}")
 
     print("\nRunning inference on observed cube...")
-    prob_map = run_inference(model, obs, device=device)
+    prob_map, reg_maps = run_inference(model, obs, device=device)
     plot_detection_map(prob_map, threshold=0.95)
+
+    # plot regression maps, masked to detected spaxels
+    detected = prob_map >= 0.95
+    titles  = {"amp_HA": "Hα amplitude [flux]",
+               "nii_ha": "NII/Hα ratio",
+               "vel":    "Velocity [km/s]",
+               "vdisp":  "Velocity dispersion [km/s]"}
+    cmaps   = {"amp_HA": "inferno", "nii_ha": "viridis",
+               "vel":    "RdBu_r",  "vdisp":  "plasma"}
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    for ax, (key, title) in zip(axes.flat, titles.items()):
+        data = np.where(detected, reg_maps[key], np.nan)
+        im   = ax.imshow(data, origin="lower", cmap=cmaps[key])
+        ax.set_title(title)
+        ax.set_xlabel("x [pixels]")
+        ax.set_ylabel("y [pixels]")
+        plt.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.show()
+    plt.close()
