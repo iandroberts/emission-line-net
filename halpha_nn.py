@@ -573,4 +573,4 @@ if __name__ == "__main__":
 
     print("\nRunning inference on observed cube...")
     prob_map = run_inference(model, obs, device=device)
-    plot_detection_map(prob_map, threshold=0.95)
+    plot_detection_map(prob_map, threshold=0.5)
