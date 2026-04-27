@@ -91,6 +91,27 @@ def estimate_alpha(flux_cube, var_cube, flux_min=0.0, flux_max=None,
 
 def plot_alpha_fit(flux_cube, var_cube, alpha, sigma_sky, result,
                    flux_max=None, var_max=None, max_points=10000):
+    """
+    Diagnostic scatter plot of variance vs flux with the fitted
+    Var = sigma_sky^2 + alpha * Flux line overlaid.
+
+    Parameters
+    ----------
+    flux_cube : ndarray, shape (n_wav, ny, nx)
+    var_cube : ndarray, shape (n_wav, ny, nx)
+    alpha : float
+        Poisson noise scaling factor from estimate_alpha().
+    sigma_sky : float
+        Sky noise standard deviation from estimate_alpha().
+    result : scipy.stats.LinregressResult
+        Full regression result from estimate_alpha().
+    flux_max : float, optional
+        Upper flux limit for display. Default None.
+    var_max : float, optional
+        Upper variance limit for display. Default None.
+    max_points : int, optional
+        Maximum number of points to plot (random subsample). Default 10000.
+    """
     flux_flat = flux_cube.ravel()
     var_flat  = var_cube.ravel()
     mask = np.isfinite(flux_flat) & np.isfinite(var_flat) & (flux_flat > 0)
@@ -122,8 +143,7 @@ def plot_alpha_fit(flux_cube, var_cube, alpha, sigma_sky, result,
 def _gauss(x, A, mu, sig):
     return A * np.exp(-(x - mu)**2 / (2*sig**2))
 
-
-def build_model_spectra(reg, lam_t, R=2500):
+def build_model_spectra(reg, lam_t):
     """
     Differentiable reconstruction of noiseless model spectra from regression
     parameters. Used in the shape loss to penalise incorrect line morphology.
@@ -132,13 +152,11 @@ def build_model_spectra(reg, lam_t, R=2500):
     ----------
     reg : tensor, shape (batch, 5)
         Regression parameters [log10(amp_HA), log10(nii_ha), vel,
-        log10(vdisp_obs), continuum]. First 4 may be NaN for no-line examples.
-    vdisp_obs is the observed (LSF-convolved) dispersion, floored at the
-    instrumental sigma.
+        log10(vdisp_obs), continuum]. First 4 may be NaN for no-line
+        examples. vdisp_obs is the observed (LSF-convolved) dispersion,
+        floored at the instrumental sigma.
     lam_t : tensor, shape (n_pixels,)
         Wavelength array [Angstroms], on the same device as reg.
-    R : float, optional
-        Instrumental spectral resolution. Default 2500.
 
     Returns
     -------
@@ -162,7 +180,6 @@ def build_model_spectra(reg, lam_t, R=2500):
         vel     = r[:, 2]
         vdisp_t = 10 ** r[:, 3]
 
-        # convolve with instrumental LSF
         # vdisp_t is already the observed (LSF-convolved) dispersion
         # shifted line centres
         lam_HA    = HA_WAV     * (1 + vel / C_KMS)
@@ -201,8 +218,9 @@ def mock_spectrum(lam, continuum, noise_sigma, eline_params=None,
     Generate a synthetic spectrum centred on H-alpha and the NII doublet.
 
     The spectrum consists of an optional emission-line signal (three Gaussians)
-    added to a flat continuum and Gaussian noise. The observed line width is the
-    quadrature sum of the intrinsic velocity dispersion and the instrumental LSF.
+    added to a flat continuum and Gaussian noise. The observed velocity
+    dispersion is passed directly as the line width — it is treated as already
+    LSF-convolved and floored at the instrumental sigma.
 
     The total noise model is:
         sigma_total(lambda)^2 = noise_sigma^2 + alpha * max(f(lambda), 0)
@@ -237,12 +255,15 @@ def mock_spectrum(lam, continuum, noise_sigma, eline_params=None,
         Wavelength array [Angstroms].
     spectrum : ndarray
         Synthetic spectrum [flux units], same shape as lam.
+    ivar : ndarray
+        Inverse variance [flux units^-2], same shape as lam.
 
     Notes
     -----
     The NII doublet amplitude ratio (6583/6548) is fixed at 3.05 by atomic
-    physics. vdisp_true is treated as the observed (LSF-convolved) line
-    width, floored at the instrumental sigma = c / (2.355 * R) km/s.
+    physics. The velocity dispersion parameter is treated as the observed
+    (LSF-convolved) line width, floored at the instrumental sigma
+    c / (2.355 * R) km/s.
     """
 
     rng = np.random.default_rng(seed=seed)
@@ -250,9 +271,7 @@ def mock_spectrum(lam, continuum, noise_sigma, eline_params=None,
     if eline_params is None:
         noiseless = np.full(lam.shape, continuum)
     else:
-        amp_HA, ha_nii_ratio, vel, vdisp_true = eline_params
-        # vdisp_true is now the observed dispersion (already LSF-convolved)
-        vdisp = vdisp_true
+        amp_HA, ha_nii_ratio, vel, vdisp = eline_params
 
         lam_NII_1 = NII_WAV[0] * (1 + vel/C_KMS)
         lam_HA = HA_WAV * (1 + vel/C_KMS)
@@ -284,6 +303,25 @@ def mock_spectrum(lam, continuum, noise_sigma, eline_params=None,
 
 def sample_eline_params(rng, amp_HA=None, vdisp_range=(10, 300),
                          R=2500):
+    """
+    Sample emission line parameters for a synthetic spectrum.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator
+    amp_HA : float, optional
+        H-alpha amplitude. If None, sampled log-uniformly from
+        [0.1, 400] flux units.
+    vdisp_range : tuple of float, optional
+        (min, max) observed velocity dispersion [km/s]. Default (10, 300).
+        The sampled value is floored at the instrumental sigma.
+    R : float, optional
+        Instrumental spectral resolution. Default 2500.
+
+    Returns
+    -------
+    tuple : (amp_HA, ha_nii_ratio, vel, vdisp_obs)
+    """
     if amp_HA is None:
         amp_HA = 10 ** rng.uniform(np.log10(0.1), np.log10(400.0))
     ha_nii_ratio = 10 ** rng.uniform(np.log10(0.5), np.log10(10.0))
@@ -466,21 +504,6 @@ class LineDetector(nn.Module):
         reg      = self.reg_head(features)
         return logit, reg
 
-class LineDetectorMLP(nn.Module):
-    def __init__(self, n_pixels, hidden_size=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(n_pixels, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(1)
-
 def train_model(train_dataset, val_dataset, model, lam, epochs=20,
         lambda_reg=1.0, lambda_shape=0.1, lambda_cont=10.0,
         batch_size=256, lr=1e-3, device="cpu"):
@@ -628,9 +651,33 @@ def train_model(train_dataset, val_dataset, model, lam, epochs=20,
         model.load_state_dict(best_state)
     return model, best_auc
 
-def learning_curve_experiment(alpha, wave, val_size=50_000, train_sizes=None,
-        seed=42):
+def learning_curve_experiment(alpha, wave, n_pixels, val_size=50_000,
+        train_sizes=None, seed=42):
+    """
+    Train LineDetector models on progressively larger subsets of a fixed
+    training pool and record validation AUC at each size, producing a
+    learning curve to identify the point of diminishing returns.
 
+    Parameters
+    ----------
+    alpha : float
+        Poisson noise scaling factor.
+    wave : ndarray
+        Wavelength array [Angstroms].
+    n_pixels : int
+        Number of spectral pixels (input size for LineDetector).
+    val_size : int, optional
+        Fixed validation set size. Default 50,000.
+    train_sizes : list of int, optional
+        Training set sizes to evaluate. Default [10k, 50k, 200k, 500k, 1M].
+    seed : int, optional
+        Master random seed. Default 42.
+
+    Returns
+    -------
+    train_sizes : list of int
+    aucs : list of float
+    """
     if train_sizes is None:
         train_sizes = [10_000, 50_000, 200_000, 500_000, 1_000_000]
 
@@ -659,10 +706,12 @@ def learning_curve_experiment(alpha, wave, val_size=50_000, train_sizes=None,
     for n in train_sizes:
         print(f"\n--- Training on {n:,} spectra ---")
         train_dataset = SpectraDataset(all_spectra[:n], all_ivars[:n], all_labels[:n], all_reg[:n])
+        model = LineDetector(n_pixels, n_filters=128, kernel_size=81)
         _, auc = train_model(
             train_dataset,
             val_dataset,
-            n_pixels,
+            model,
+            lam=lam,
             device=device,
         )
         aucs.append(auc)
@@ -682,6 +731,21 @@ def plot_learning_curve(train_sizes, aucs):
     plt.close()
 
 class ObservedData:
+    """
+    Load and pre-process an IFU data cube for neural network inference.
+
+    Reads flux and inverse variance from a FITS file, applies a redshift
+    correction to the wavelength axis, and optionally spatially rebins
+    the cube. The wavelength array is trimmed to the rest-frame window
+    around H-alpha and NII used by the synthetic training spectra.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Must contain: cid (int, galaxy ID), z (float, redshift).
+    Nrebin : int or None, optional
+        Spatial rebinning factor. If None, no rebinning is applied.
+    """
     def __init__(self, args, Nrebin=None):
         hdul = fits.open(f"clifs{args.cid}/calibrated_cube.fits")
         flux = hdul["FLUX"].data
@@ -750,7 +814,7 @@ def run_inference(model, obs, device="cpu", batch_size=1024, R=2500):
             all_reg.append(reg.cpu())
 
     prob_map = torch.cat(all_probs).numpy().reshape(ny, nx)
-    reg_out  = torch.cat(all_reg).numpy()   # shape (ny*nx, 4)
+    reg_out  = torch.cat(all_reg).numpy()   # shape (ny*nx, 5)
 
     # convert from log/linear predicted space back to physical units
     reg_maps = {
